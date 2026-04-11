@@ -4,6 +4,11 @@ import { registerRenderLayer } from './registerRenderLayer'
 import { FillLayerVisualizer } from './visualizers/FillLayerVisualizer'
 
 export class FillRenderLayer extends IRenderLayer {
+  constructor(sourceFeatures, styleLayer, tile) {
+    super(sourceFeatures, styleLayer, tile)
+    this.outlineOffsets = []
+    this.outlineCounts = []
+  }
   /**
    * @param {Cesium.FrameState} frameState
    * @param {VectorTileset} tileset

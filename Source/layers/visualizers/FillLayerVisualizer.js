@@ -22,6 +22,7 @@ export class FillLayerVisualizer extends ILayerVisualizer {
     super(layers, tile)
 
     this.geometryInstances = []
+    this.outlineGeometryInstances = []
     this.primitive = null
     this.commandsReady = false
   }
@@ -67,6 +68,11 @@ export class FillLayerVisualizer extends ILayerVisualizer {
         sourceFeature
       )
 
+      const fillOutlineColor =
+        style.convertColor(
+          style.paint.getDataValue('fill-outline-color', tile.z, sourceFeature)
+        ) || fillColor
+
       //关键：对投影坐标细分，而不是使用cesium内置的细分
       const vtCoords = loadGeometry(sourceFeature)
       const polygons = classifyRings(vtCoords)
@@ -84,6 +90,7 @@ export class FillLayerVisualizer extends ILayerVisualizer {
           featureId,
           fillColor,
           fillOpacity,
+          fillOutlineColor,
           properties,
           //保存原始数据的要素id，后续可以用来支持 featureState 表达式，这个表达式可以实现选定要素高亮显示
           id: sourceFeatureId,
@@ -187,9 +194,12 @@ export class FillLayerVisualizer extends ILayerVisualizer {
    */
   addFeature(feature, granularity) {
     const geometryInstances = this.geometryInstances
+    const outlineGeometryInstances = this.outlineGeometryInstances
     const { coordinates, fillColor, fillOpacity } = feature
     const colorBytes = fillColor.toBytes()
     colorBytes[3] = Math.floor(colorBytes[3] * fillOpacity)
+    const outlineColorBytes = fillColor.toBytes()
+    outlineColorBytes[3] = Math.floor(outlineColorBytes[3] * fillOpacity)
 
     // 使用 maplibre-gl 的 subdividePolygon 基于投影坐标进行细分，
     // 而不是在转成世界坐标后再使用 Cesium.PolygonGeometry 构建，这样才能避免出现自相交、破面等现象。
@@ -199,7 +209,7 @@ export class FillLayerVisualizer extends ILayerVisualizer {
       coordinates,
       this.tile,
       granularity,
-      false
+      true
     )
     const verticesFlattened = subdivisionRes.verticesFlattened
     const coordDeg = [0, 0],
@@ -241,6 +251,14 @@ export class FillLayerVisualizer extends ILayerVisualizer {
           : Uint8Array
     )(subdivisionRes.indicesTriangles)
 
+    const outlineIndices = new (
+      vertCount > 65535
+        ? Uint32Array
+        : vertCount > 255
+          ? Uint16Array
+          : Uint8Array
+    )(subdivisionRes.indicesLineList.flat(3))
+
     const geometry = new Cesium.Geometry({
       attributes: {
         position: {
@@ -264,6 +282,19 @@ export class FillLayerVisualizer extends ILayerVisualizer {
       },
       primitiveType: Cesium.PrimitiveType.TRIANGLES,
       indices: indices,
+      boundingSphere: Cesium.BoundingSphere.fromVertices(positions)
+    })
+    const outlineGeometry = new Cesium.Geometry({
+      attributes: {
+        position: {
+          componentDatatype: Cesium.ComponentDatatype.DOUBLE,
+          componentsPerAttribute: 3,
+          normalize: false,
+          values: positions
+        }
+      },
+      primitiveType: Cesium.PrimitiveType.LINES,
+      indices: outlineIndices,
       boundingSphere: Cesium.BoundingSphere.fromVertices(positions)
     })
 
@@ -295,6 +326,25 @@ export class FillLayerVisualizer extends ILayerVisualizer {
       })
     })
     geometryInstances.push(instance)
+
+    const outlineInstance = new Cesium.GeometryInstance({
+      geometry: outlineGeometry,
+      attributes: {
+        color: new Cesium.GeometryInstanceAttribute({
+          componentDatatype: Cesium.ComponentDatatype.UNSIGNED_BYTE,
+          componentsPerAttribute: 4,
+          normalize: true,
+          value: outlineColorBytes
+        })
+      },
+      //通过entity的形式暴露给Cesium pickEntity，这样点击时系统自带的inforbox可以弹出
+      id: new Cesium.Entity({
+        position: center,
+        id: feature.id,
+        properties: feature.properties
+      })
+    })
+    outlineGeometryInstances.push(outlineInstance)
   }
 
   createPrimitive() {
@@ -433,6 +483,140 @@ void main()
     }
   }
 
+  createOutlinePrimitive() {
+    const primitive = new Cesium.Primitive({
+      geometryInstances: this.outlineGeometryInstances,
+      asynchronous: !(
+        this.outlineGeometryInstances[0].geometry instanceof Cesium.Geometry
+      ),
+      appearance: new Cesium.PerInstanceColorAppearance({
+        flat: true,
+        translucent: false,
+        renderState: {
+          //这里设置是没有用的，只要 translucent 为 false，
+          //Cesium 内部都会覆盖成 true，所以我们需要在 DrawCommand 创建完成后再设置
+          depthMask: false
+        },
+        fragmentShaderSource: /*glsl*/ ` 
+in vec4 v_color;
+
+uniform vec4 tileId;
+uniform sampler2D tileIdTexture;
+
+void main()
+{
+    vec2 id_st = gl_FragCoord.xy / czm_viewport.zw; 
+    vec4 bgId = texture(tileIdTexture, id_st);
+    if (!all(equal(bgId, tileId)))
+    {
+       discard;
+    }
+    out_FragColor = v_color;
+}
+                `
+      })
+    })
+
+    //通过定义 Primitive 私有变量 _geometries、_batchTable 的 setter 和 getter，
+    //监听合批几何体和批次表的创建：
+    //1、几何体创建完成后，根据 batchId 和 featureId，计算每个图层几何体的起始索引（offset）和索引数量（count）
+    //2、批次表创建完成后，保存备用
+    let scope = this
+    Object.defineProperties(primitive, {
+      _geometries: {
+        get() {
+          return this._geometries_
+        },
+        set(geometries) {
+          this._geometries_ = geometries
+          if (geometries) {
+            scope.onOutlineGeometriesLoaded(geometries)
+          } else {
+            scope = null
+          }
+        }
+      },
+      _batchTable: {
+        get() {
+          return this._batchTable_
+        },
+        set(batchTable) {
+          this._batchTable_ = batchTable
+          if (batchTable) {
+            scope.onOutlineBatchTableCreated(batchTable)
+          }
+        }
+      }
+    })
+
+    this.outlinePrimitive = primitive
+  }
+  /**
+   * 根据 batchId 和 featureId，计算每个图层几何体的起始索引（offset）和索引数量（count）
+   * @param {Cesium.Geometry[]} geometries
+   */
+  onOutlineGeometriesLoaded(geometries) {
+    //Cesium 几何体合批结果可能是多个几何体，对应多个 DrawCommand
+    for (let pass = 0; pass < geometries.length; pass++) {
+      const batches = {}
+      const geometry = geometries[pass]
+      const batchIds = geometry.attributes.batchId.values
+      const indices = geometry.indices
+
+      //提取每个批次的起始和结束索引
+      let currBatchId = -1
+      let currBatch = null
+      for (let i = 0; i < indices.length; i++) {
+        const vertIndex = indices[i]
+        const batchId = batchIds[vertIndex]
+        if (currBatchId !== batchId) {
+          currBatchId = batchId
+          currBatch = batches[currBatchId] = {
+            begin: i,
+            end: i
+          }
+        }
+        currBatch.end = i
+      }
+
+      //根据图层批次范围，提取图层几何体索引范围，即起始索引（offset）和索引数量（count）
+      for (const layer of this.layers) {
+        const { firstBatchId, lastBatchId } = layer
+        if (firstBatchId === -1 || lastBatchId === -1) {
+          continue
+        }
+
+        let begin = -1,
+          end = -1
+        for (let batchId = firstBatchId; batchId <= lastBatchId; batchId++) {
+          const batch = batches[batchId]
+          if (batch) {
+            if (begin === -1) begin = batch.begin
+            end = batch.end
+          }
+        }
+
+        if (begin === -1 || end === -1) {
+          continue
+        }
+
+        //起始和结束索引，索引数量需要加1
+        layer.outlineOffsets[pass] = begin
+        layer.outlineCounts[pass] = end - begin + 1
+      }
+    }
+  }
+  /**
+   * 保存 Cesium Primitive 创建的批次表。图层样式变化时，通过更新批次表传递到GPU，同步更新渲染效果
+   * @param {Cesium.BatchTable} batchTable
+   */
+  onOutlineBatchTableCreated(batchTable) {
+    this._outlineBatchTable = batchTable
+    for (const layer of this.layers) {
+      layer._outlineBatchTable = batchTable
+    }
+  }
+
   /**
    * 使用合批后的 drawCommand 创建副本，为渲染图层分配 drawCommand
    * @param {Cesium.DrawCommand[]} batchedCommandList
@@ -456,14 +640,29 @@ void main()
     for (let i = 0; i < this.layers.length; i++) {
       const layer = this.layers[i]
       const layerCommandList = (layer.commandList = [])
+      const passes = {
+        fill: 0,
+        outline: 0
+      }
 
-      for (let pass = 0; pass < batchedCommandList.length; pass++) {
-        const offset = layer.offsets[pass],
-          count = layer.counts[pass]
+      for (let i = 0; i < batchedCommandList.length; i++) {
+        const command = batchedCommandList[i]
+        let pass, offsets, counts
+        if (command.primitiveType == Cesium.PrimitiveType.LINES) {
+          pass = passes.outline++
+          offsets = layer.outlineOffsets
+          counts = layer.outlineCounts
+        } else {
+          pass = passes.fill++
+          offsets = layer.offsets
+          counts = layer.counts
+        }
+
+        const offset = offsets[pass],
+          count = counts[pass]
         if (typeof offset !== 'number' || typeof count !== 'number') {
           continue
         }
-        const command = batchedCommandList[pass]
         command.uniformMap.tileIdTexture = function () {
           return tileset.tileIdTexture
         }
@@ -497,6 +696,7 @@ void main()
 
     if (!this.primitive && this.geometryInstances.length) {
       this.createPrimitive()
+      this.createOutlinePrimitive()
     }
 
     if (this.primitive && this.state !== 'done' && this.state !== 'error') {
@@ -508,9 +708,11 @@ void main()
       //执行 primitive 的 update ，直到生成了合批后的drawCommand
       try {
         this.primitive.update(frameState)
+        this.outlinePrimitive.update(frameState)
       } catch (err) {
         //如果报错，下一帧就不要再执行 update 了，以免重复打印错误信息
         this.geometryInstances = []
+        this.outlineGeometryInstances = []
         this.setState('error')
         if (err.stack) console.trace(err.stack)
         else console.error(err)
@@ -525,7 +727,10 @@ void main()
         this.createLayerCommands(batchedCommandList, tileset)
       }
 
-      if (this.primitive._state === Cesium.PrimitiveState.FAILED) {
+      if (
+        this.primitive._state === Cesium.PrimitiveState.FAILED ||
+        this.outlinePrimitive._state === Cesium.PrimitiveState.FAILED
+      ) {
         this.setState('error')
       }
 
@@ -534,6 +739,9 @@ void main()
 
     if (this._batchTable && this._batchTable._batchValuesDirty) {
       this._batchTable.update(frameState)
+    }
+    if (this._outlineBatchTable && this._outlineBatchTable._batchValuesDirty) {
+      this._outlineBatchTable.update(frameState)
     }
   }
 

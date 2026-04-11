@@ -57,6 +57,7 @@ export class StyleLayer {
    * @returns
    */
   convertColor(styleColor, result) {
+    if (!styleColor) return
     const alphaScalar = styleColor.a > 0 ? 1 / styleColor.a : 1
     if (!result) {
       result = new Cesium.Color()
