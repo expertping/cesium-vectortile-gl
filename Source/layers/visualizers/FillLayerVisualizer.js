@@ -195,10 +195,10 @@ export class FillLayerVisualizer extends ILayerVisualizer {
   addFeature(feature, granularity) {
     const geometryInstances = this.geometryInstances
     const outlineGeometryInstances = this.outlineGeometryInstances
-    const { coordinates, fillColor, fillOpacity } = feature
+    const { coordinates, fillColor, fillOpacity, fillOutlineColor } = feature
     const colorBytes = fillColor.toBytes()
     colorBytes[3] = Math.floor(colorBytes[3] * fillOpacity)
-    const outlineColorBytes = fillColor.toBytes()
+    const outlineColorBytes = fillOutlineColor.toBytes()
     outlineColorBytes[3] = Math.floor(outlineColorBytes[3] * fillOpacity)
 
     // 使用 maplibre-gl 的 subdividePolygon 基于投影坐标进行细分，
